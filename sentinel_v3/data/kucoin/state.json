@@ -1,40 +1,6 @@
 {
-    "balance": -89296.93119928299,
+    "balance": 10000.0,
     "positions": {},
-    "trade_history": [
-        {
-            "symbol": "ETHUSDTM",
-            "side": "LONG",
-            "size": 32.095245,
-            "entry_price": 2959.94,
-            "exit_price": 2.0,
-            "pnl": -94935.8475,
-            "roe_pct": -999.32,
-            "leverage": 10,
-            "timestamp": 1769274557241
-        },
-        {
-            "symbol": "XBTUSDTM",
-            "side": "LONG",
-            "size": 0.047125,
-            "entry_price": 89305.2,
-            "exit_price": 2.0,
-            "pnl": -4208.4134,
-            "roe_pct": -999.98,
-            "leverage": 10,
-            "timestamp": 1769274567279
-        },
-        {
-            "symbol": "ENSOUSDTM",
-            "side": "SHORT",
-            "size": 139.64781,
-            "entry_price": 1.335,
-            "exit_price": 2.0,
-            "pnl": -93.0334,
-            "roe_pct": -498.13,
-            "leverage": 10,
-            "timestamp": 1769274567286
-        }
-    ],
-    "last_updated": 1769274567
+    "trade_history": [],
+    "last_updated": 0
 }

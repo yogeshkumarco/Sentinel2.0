@@ -104,23 +104,24 @@ class TradingConfig:
     
     # Timeframes to analyze
     timeframes: List[Timeframe] = field(default_factory=lambda: [
-        Timeframe.M15,  # Primary for Harmonic Patterns (Sniper)
+        Timeframe.M5,   # Execution refinement
+        Timeframe.M15,  # Signal generation
         Timeframe.H1,   # Context
     ])
     
-    # Primary Timeframe for Analysis (Changed to 5m for more signals)
-    primary_timeframe: str = "5m"
+    # Primary Timeframe for Analysis (15m as requested)
+    primary_timeframe: str = "15m"
     
     # Strategy Mode
-    strategy_mode: str = "sniper"  # "sniper" = Harmonic Patterns
+    strategy_mode: str = "sniper"  # "sniper" = Harmonic Patterns + Intraday Logic
     
-    # Bot logic settings
-    take_profit_pct: float = 0.5  # 0.5% price move
-    stop_loss_pct: float = 0.35   # 0.35% price move
-    trailing_stop_pct: float = 0.15
+    # Bot logic settings (Intraday Specifics)
+    take_profit_pct: float = 2.5  # Target +2.5% for partials
+    stop_loss_pct: float = 2.0    # 2% Risk (Adjusted dynamically by leverage)
+    trailing_stop_pct: float = 0.5 # Tighter trail
     
     # Harmonic Pattern Specifics
-    max_hold_candles: int = 50  # Longer holds for 15m patterns
+    max_hold_candles: int = 30  # ~2 hours max hold on 5m
     min_volume_multiplier: float = 1.2  # Volume must be 1.2x average
     max_spread_pct: float = 0.1
 
@@ -128,17 +129,17 @@ class TradingConfig:
 @dataclass
 class RiskConfig:
     """Risk management parameters"""
-    # Max risk per trade (% of capital) - UPDATED for Sniper Strategy
-    max_risk_per_trade_pct: float = 2.0
+    # Max risk per trade (% of capital) - SAFE INTRADAY
+    max_risk_per_trade_pct: float = 1.5
     
     # Max daily loss (% of capital)
-    max_daily_loss: float = 3.0
+    max_daily_loss: float = 4.0
     
     # Max drawdown before pause (% of capital)
-    max_drawdown: float = 10.0
+    max_drawdown: float = 8.0
     
     # Max concurrent positions
-    max_positions: int = 3
+    max_positions: int = 4
     
     # Max leverage allowed (overridden by LEVERAGE_TIERS per symbol)
     max_leverage: int = 10
@@ -167,7 +168,7 @@ class ModelConfig:
 class Config:
     """Main configuration"""
     # Operating mode
-    mode: Mode = Mode.DRY_RUN
+    mode: Mode = Mode.LIVE
     
     # Exchange Selection
     exchange_provider: str = field(default_factory=lambda: os.getenv("EXCHANGE_PROVIDER", "binance").lower())

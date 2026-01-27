@@ -389,6 +389,10 @@ class KuCoinAdapter(ExchangeProvider):
         """Close position"""
         exec_price = self.get_current_price(symbol)
         
+        if exec_price <= 0:
+            logger.error(f"Cannot close {symbol}: Invalid price {exec_price}")
+            return {}
+        
         if self.is_paper:
             return self.paper.close_position(symbol, exec_price)
         
@@ -427,6 +431,7 @@ class KuCoinAdapter(ExchangeProvider):
         except Exception as e:
             # Endpoint may not exist or mode already set - silently continue
             # The order will fail with 330005 if truly wrong, handled in place_order
+            logger.warning(f"Failed to set margin mode for {symbol}: {e}")
             pass
 
     def get_current_price(self, symbol: str) -> float:

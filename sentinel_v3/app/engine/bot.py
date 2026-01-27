@@ -154,39 +154,47 @@ class TradingBot:
             if pnl_pct > state['peak_pnl']:
                 state['peak_pnl'] = pnl_pct
             
-            duration_candles = (time.time() - state['entry_time']) / 60
+            trade_age_minutes = (time.time() - state['entry_time']) / 60
             
-            # --- EXIT LOGIC ---
+            # --- EXIT LOGIC (Freqtrade Wisdom) ---
             
             # 1. Fixed Stop Loss
             sl_pct = settings.trading.stop_loss_pct * pos.leverage
             if state['is_breakeven']:
-                sl_pct = -0.05 
+                sl_pct = -0.05  # Near breakeven
                 
             if pnl_pct <= -sl_pct:
                 logger.info(f"🚨 SL TRIGGERED for {symbol}: {pnl_pct:.2f}%")
                 self._close(symbol, "SL Hit", pnl_pct)
                 continue
 
-            # 2. Smart Trail (Breakeven Trigger)
-            if pnl_pct > 0.15 and not state['is_breakeven']:
+            # 2. PROFIT PROTECTION (Freqtrade Rule: Close 50% at +4%, SL to entry)
+            # Note: Full close here since partial not yet implemented
+            if pnl_pct >= 4.0 and not state.get('took_profit', False):
+                state['took_profit'] = True
                 state['is_breakeven'] = True
-                logger.info(f"🔒 PROTECT: Profit > 0.15%, moving SL to Breakeven for {symbol}")
+                logger.info(f"💰 PROFIT PROTECTION: +{pnl_pct:.2f}% hit! Moving SL to breakeven.")
+                # Could implement partial close here. For now, log and protect.
 
-            # 3. Time Stop
-            if duration_candles >= settings.trading.max_hold_candles and pnl_pct < 0.1:
-                logger.info(f"⏱️ Time Stop: Held {duration_candles:.1f}m with low profit.")
-                self._close(symbol, "Time Stop", pnl_pct)
+            # 3. Smart Trail (Breakeven Trigger at +1.5%)
+            if pnl_pct > 1.5 and not state['is_breakeven']:
+                state['is_breakeven'] = True
+                logger.info(f"🔒 PROTECT: Profit > 1.5%, moving SL to Breakeven for {symbol}")
+
+            # 4. DEAD TRADE EXIT (Freqtrade Rule: 45 min + PnL < 1%)
+            if trade_age_minutes >= 45 and pnl_pct < 1.0:
+                logger.info(f"💀 DEAD TRADE: Held {trade_age_minutes:.1f}m with only {pnl_pct:.2f}% profit. Exiting.")
+                self._close(symbol, "Dead Trade (45m)", pnl_pct)
                 continue
             
-            # 4. Reversal Check
+            # 5. Reversal Check
             should_close, reason = self._check_reversal(symbol, pos.side)
             if should_close:
                 logger.info(f"🔄 Reversal Detected: {reason}")
                 self._close(symbol, "Reversal", pnl_pct)
                 continue
             
-            # 5. Let Winners Run (Dynamic Trail)
+            # 6. Let Winners Run (Dynamic Trail after TP target)
             target = settings.trading.take_profit_pct * pos.leverage
             if pnl_pct >= target:
                 trail_dist = 0.3 * pos.leverage 
@@ -219,6 +227,16 @@ class TradingBot:
         # Compute Features
         pf = PriceFeatures(df)
         df = pf.compute_all()
+
+        # IMPULSE EXHAUSTION FILTER (Freqtrade Rule)
+        # Skip entry if last 10 candles moved > 5% (chasing exhausted move)
+        if len(df) >= 10:
+            recent_high = df['high'].iloc[-10:].max()
+            recent_low = df['low'].iloc[-10:].min()
+            recent_move_pct = (recent_high - recent_low) / recent_low * 100
+            if recent_move_pct > 5.0:
+                logger.debug(f"⚠️ IMPULSE FILTER: {symbol} moved {recent_move_pct:.1f}% in last 10 candles. Skipping entry.")
+                return
 
         # Analyze
         decision = self.decision_engine.analyze(df)
@@ -293,7 +311,7 @@ class TradingBot:
 
     def _check_reversal(self, symbol: str, current_side: str) -> (bool, str):
         """Check for reversal signals"""
-        df = self.exchange.get_market_structure(symbol, settings.trading.primary_timeframe.value)
+        df = self.exchange.get_market_structure(symbol, settings.trading.primary_timeframe)
         if df.empty:
             return False, ""
         pf = PriceFeatures(df)
