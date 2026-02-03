@@ -223,37 +223,37 @@ class KuCoinAdapter(ExchangeProvider):
         if settings.trading.use_websockets:
             self.start_ws(symbol, timeframe)
         
-        # Check cache first
-        if not self.market_cache.get(symbol):
-            # Fetch REST snapshot
-            try:
-                raw_klines = self._request('GET', '/api/v1/kline/query', 
-                                         params={'symbol': symbol, 'granularity': granularity})
-            except Exception as e:
-                logger.error(f"Failed to fetch klines for {symbol}: {e}")
-                return pd.DataFrame()
-            
-            if not raw_klines:
-                return pd.DataFrame()
-            
-            # Convert to cache format
-            snapshot = []
-            for k in raw_klines:
-                snapshot.append({
-                    'time': int(k[0]),
-                    'open': float(k[1]),
-                    'high': float(k[2]),
-                    'low': float(k[3]),
-                    'close': float(k[4]),
-                    'volume': float(k[5]) if len(k) > 5 else 0,
-                    'closed': True
-                })
-            
-            self.market_cache[symbol] = snapshot
-            
-            # Update paper price from snapshot
-            if snapshot and self.is_paper:
-                self.paper.update_mark_prices({symbol: snapshot[-1]['close']})
+        # ALWAYS fetch fresh data from API for accurate analysis
+        # Previously cached data was stale and caused incorrect decisions
+        try:
+            raw_klines = self._request('GET', '/api/v1/kline/query', 
+                                     params={'symbol': symbol, 'granularity': granularity})
+        except Exception as e:
+            logger.error(f"Failed to fetch klines for {symbol}: {e}")
+            return pd.DataFrame()
+        
+        if not raw_klines:
+            return pd.DataFrame()
+        
+        # Convert to cache format
+        snapshot = []
+        for k in raw_klines:
+            snapshot.append({
+                'time': int(k[0]),
+                'open': float(k[1]),
+                'high': float(k[2]),
+                'low': float(k[3]),
+                'close': float(k[4]),
+                'volume': float(k[5]) if len(k) > 5 else 0,
+                'closed': True
+            })
+        
+        self.market_cache[symbol] = snapshot
+        
+        # Update paper price from snapshot
+        # NOTE: KuCoin returns newest candle FIRST, so [0] is most recent
+        if snapshot and self.is_paper:
+            self.paper.update_mark_prices({symbol: snapshot[0]['close']})
         
         # Return from cache
         data = self.market_cache.get(symbol, [])
@@ -261,6 +261,13 @@ class KuCoinAdapter(ExchangeProvider):
             return pd.DataFrame()
         
         df = pd.DataFrame(data)
+        # Ensure numeric types
+        cols = ['open', 'high', 'low', 'close', 'volume']
+        df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
+        
+        # Sort by time ASCENDING (Oldest -> Newest)
+        df = df.sort_values('time').reset_index(drop=True)
+        
         return df[['time', 'open', 'high', 'low', 'close', 'volume']].tail(limit)
 
     def get_open_positions(self) -> List[Position]:
@@ -321,6 +328,22 @@ class KuCoinAdapter(ExchangeProvider):
             logger.error(f"Error fetching balance: {e}")
             return 0.0
 
+    def _set_margin_mode(self, symbol: str, mode: str):
+        """
+        Set margin mode (ISOLATED/CROSS) via V2 Endpoint.
+        """
+        try:
+            body = {
+                "symbol": symbol,
+                "marginMode": mode.upper()
+            }
+            # Correct V2 Endpoint
+            self._request('POST', '/api/v2/position/changeMarginMode', body=body, private=True)
+        except Exception as e:
+            # If already in that mode, it might return error, which is fine.
+            # But if it fails for other reasons, we log it.
+            logger.warning(f"Set Margin Mode to {mode} result: {e}")
+
     def place_order(self, symbol: str, side: str, order_type: str, quantity: float, leverage: int, price: Optional[float] = None, reduce_only: bool = False) -> Dict:
         """Place Order"""
         # Get price for paper trading
@@ -329,10 +352,11 @@ class KuCoinAdapter(ExchangeProvider):
         if self.is_paper:
             return self.paper.place_order(symbol, side, quantity, leverage, exec_price)
         
-        # Set Margin Mode to ISOLATED before placing order
-        self._set_margin_mode(symbol, 'ISOLATED')
+        # LIVE TRADING
+        # 1. Enforce ISOLATED Mode (User Requirement)
+        if not reduce_only:
+            self._set_margin_mode(symbol, 'ISOLATED')
         
-        # Live trading (original code)
         # Convert LONG/SHORT to buy/sell for KuCoin API
         s_upper = side.upper()
         if s_upper == 'LONG':
@@ -340,31 +364,40 @@ class KuCoinAdapter(ExchangeProvider):
         elif s_upper == 'SHORT':
             kucoin_side = 'sell'
         else:
-            # Assume already 'buy' or 'sell'
             kucoin_side = side.lower()
             
         # Format Quantity using Contract Multiplier
-        # KuCoin Futures requires 'size' (Integer Lots)
-        # Lots = BaseAmount / Multiplier
-        
+        # Reference: https://www.kucoin.com/futures/contract/detail
         multiplier = 1.0
         if symbol in self.contract_specs:
             multiplier = self.contract_specs[symbol]['multiplier']
         elif 'XBT' in symbol or 'BTC' in symbol:
-            multiplier = 0.001
+            multiplier = 0.001  # 1 lot = 0.001 BTC
         elif 'ETH' in symbol:
-            multiplier = 0.01
+            multiplier = 0.01   # 1 lot = 0.01 ETH
         elif 'SOL' in symbol:
-            multiplier = 0.1
+            multiplier = 0.1    # 1 lot = 0.1 SOL
+        elif 'LTC' in symbol:
+            multiplier = 0.1    # 1 lot = 0.1 LTC
+        elif 'LINK' in symbol:
+            multiplier = 1.0    # 1 lot = 1 LINK
+        elif 'SUI' in symbol:
+            multiplier = 1.0    # 1 lot = 1 SUI
+        elif 'ADA' in symbol:
+            multiplier = 10.0   # 1 lot = 10 ADA
+        elif 'XRP' in symbol:
+            multiplier = 10.0   # 1 lot = 10 XRP
+        elif 'DOGE' in symbol:
+            multiplier = 100.0  # 1 lot = 100 DOGE
+        elif 'PEPE' in symbol:
+            multiplier = 1000000.0  # 1 lot = 1M PEPE (meme coin)
+        elif 'ZEC' in symbol:
+            multiplier = 0.1    # 1 lot = 0.1 ZEC
             
-        # Calculate Lots
-        # e.g. Qty 0.022 ETH / 0.01 = 2.2 -> 2 Lots
-        # If Qty < Multiplier, size becomes 0.
-        
         try:
             lots = int(quantity / multiplier)
             if lots < 1:
-                logger.warning(f"Quantity {quantity} too small for {symbol} (Multiplier: {multiplier}). Setting to 1.")
+                logger.warning(f"Quantity {quantity} too small for {symbol}. Setting to 1.")
                 lots = 1
         except Exception:
             lots = int(quantity)
@@ -375,18 +408,19 @@ class KuCoinAdapter(ExchangeProvider):
             'side': kucoin_side,
             'type': order_type.lower(),
             'leverage': str(leverage),
-            'size': lots, # Send integer Lots
-            'reduceOnly': reduce_only
-            # Note: marginMode removed - uses account default to avoid 330005 errors
+            'size': lots,
+            'reduceOnly': reduce_only,
+            'marginMode': 'ISOLATED' # Explicitly request ISOLATED
         }
         
         if order_type.lower() == 'limit' and price:
             body['price'] = str(price)
             
+        # Place Order
         return self._request('POST', '/api/v1/orders', body=body, private=True)
 
     def close_position(self, symbol: str, size: Optional[float] = None) -> Dict:
-        """Close position"""
+        """Close position using KuCoin's closeOrder parameter"""
         exec_price = self.get_current_price(symbol)
         
         if exec_price <= 0:
@@ -396,55 +430,44 @@ class KuCoinAdapter(ExchangeProvider):
         if self.is_paper:
             return self.paper.close_position(symbol, exec_price)
         
-        # Live trading (original code)
-        positions = self.get_open_positions()
-        target = next((p for p in positions if p.symbol == symbol), None)
-        
-        if not target:
-            logger.warning(f"No position found for {symbol} to close.")
-            return {}
-            
-        close_qty = int(size) if size else target.size
-        close_side = 'sell' if target.side == 'LONG' else 'buy'
-        
-        return self.place_order(
-            symbol=symbol,
-            side=close_side,
-            order_type='market',
-            quantity=close_qty,
-            leverage=target.leverage,
-            reduce_only=True
-        )
-
-    def _set_margin_mode(self, symbol: str, mode: str):
-        """
-        Set margin mode (ISOLATED/CROSS).
-        KuCoin Endpoint varies - try multiple endpoints.
-        """
+        # Live trading - Use closeOrder=True (KuCoin handles side/size automatically)
+        # This is the recommended approach per KuCoin Futures API docs
         try:
-            # Try the standard endpoint first
             body = {
-                "symbol": symbol,
-                "marginMode": mode.upper()
+                'clientOid': str(int(time.time() * 1000)),
+                'symbol': symbol,
+                'type': 'market',
+                'closeOrder': True  # <-- KuCoin API closes entire position automatically
             }
-            self._request('POST', '/api/v1/position/margin-mode', body=body, private=True)
+            
+            logger.info(f"📤 KuCoin Close Order: {symbol} (closeOrder=True)")
+            result = self._request('POST', '/api/v1/orders', body=body, private=True)
+            
+            if result and result.get('orderId'):
+                logger.info(f"✅ KuCoin Position Closed: {symbol} - Order ID: {result['orderId']}")
+            return result
+            
         except Exception as e:
-            # Endpoint may not exist or mode already set - silently continue
-            # The order will fail with 330005 if truly wrong, handled in place_order
-            logger.warning(f"Failed to set margin mode for {symbol}: {e}")
-            pass
+            logger.error(f"KuCoin Close Position Error: {e}")
+            return {}
+
+
 
     def get_current_price(self, symbol: str) -> float:
         """Get latest price (cache-first for low latency)"""
         # Check cache first (fastest)
+        # IMPORTANT: KuCoin returns candles NEWEST FIRST, so cache[0] is the latest!
         cache = self.market_cache.get(symbol)
         if cache:
-            return cache[-1]['close']
-        
-        # Fallback to REST
+            price = cache[0]['close']  # First element = newest candle
+            return price
+            
         try:
-            res = self._request('GET', '/api/v1/ticker', {'symbol': symbol})
-            return float(res.get('price', 0))
+            # Fallback to API Ticker
+            ticker = self._request('GET', f'/api/v1/ticker?symbol={symbol}')
+            price = float(ticker['price'])
+            logger.info(f"💲 Price({symbol}) from API: {price}")
+            return price
         except Exception as e:
             logger.error(f"Error fetching price for {symbol}: {e}")
             return 0.0
@@ -491,37 +514,44 @@ class KuCoinAdapter(ExchangeProvider):
             return self.paper.trade_history[-limit:]
         
         # Live Implementation - Use Recent Done Orders
+        # Live Implementation - Use Recent Fills (Better than Orders)
         try:
-            # Endpoint: GET /api/v1/recentDoneOrders
-            # Returns recently closed orders (last 24 hours, up to 1000)
-            # No params required for basic usage
-            
-            res = self._request('GET', '/api/v1/recentDoneOrders', private=True)
+            # Endpoint: GET /api/v1/recentFills
+            # Returns recent executions including price/size
+            res = self._request('GET', '/api/v1/recentFills', private=True)
             
             if not res:
                 return []
                 
-            # Response is a list of order objects
+            # Response is a list of fill objects
             items = res if isinstance(res, list) else res.get('items', []) if isinstance(res, dict) else []
             
             trades = []
-            for order in items:
-                # Order fields: symbol, side, price, size, value, filledQty, filledValue, etc.
-                # Note: Individual order doesn't have full PnL - that requires matching entry/exit
+            for fill in items:
+                # Fill fields: symbol, side, price, size, value, fee, tradeId, etc.
+                price = float(fill.get('price', 0))
+                size = float(fill.get('size', 0))
+                fee = float(fill.get('fee', 0))
                 
                 trades.append({
-                    "symbol": order.get('symbol', ''),
-                    "side": order.get('side', 'unknown').upper(),
-                    "size": float(order.get('filledSize', order.get('size', 0))),
-                    "entry_price": float(order.get('price', order.get('dealValue', 0))),
-                    "exit_price": 0,  # Would need to match with opposite order
-                    "pnl": 0,  # Calculate separately or from position data
+                    "symbol": fill.get('symbol', ''),
+                    "side": fill.get('side', 'unknown').upper(),
+                    "size": size,
+                    "entry_price": price,
+                    # For fills, entry is the execution price. 
+                    # We can't easily know if it was an "open" or "close" without more context,
+                    # but accurate price is better than $0.00
+                    "exit_price": 0, 
+                    "pnl": 0,  # Still hard to calc per-fill PnL without position tracking
                     "roe_pct": 0,
-                    "leverage": int(float(order.get('leverage', 1))),  # Handle '10.0' strings
-                    "timestamp": order.get('updatedAt', order.get('createdAt', '')),
-                    "type": "CLOSED_ORDER"
+                    "leverage": 0, # Fills don't always have leverage info
+                    "timestamp": fill.get('createdAt', ''),
+                    "type": "FILL"
                 })
             return trades
+        except Exception as e:
+            logger.error(f"Error fetching recent fills: {e}")
+            return []
         except Exception as e:
             logger.error(f"Error fetching recent orders: {e}")
             return []

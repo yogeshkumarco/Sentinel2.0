@@ -4,6 +4,9 @@ import pandas as pd
 import logging
 import requests
 import time
+import hmac
+import hashlib
+from urllib.parse import urlencode
 from app.exchanges.abstract import ExchangeProvider, Position
 from app.core.config import settings
 from app.engine.paper_engine import PaperTradingEngine
@@ -57,6 +60,46 @@ class BinanceAdapter(ExchangeProvider):
 
     def connect(self) -> bool:
         return True
+
+    def _sign_request(self, params: Dict) -> Dict:
+        """Generate HMAC-SHA256 signature for Binance authenticated requests"""
+        params['timestamp'] = int(time.time() * 1000)
+        query_string = urlencode(params)
+        signature = hmac.new(
+            self.api_secret.encode('utf-8'),
+            query_string.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        params['signature'] = signature
+        return params
+
+    def _signed_request(self, method: str, endpoint: str, params: Dict = None) -> Dict:
+        """Make a signed request to Binance Futures API"""
+        if params is None:
+            params = {}
+        
+        signed_params = self._sign_request(params)
+        headers = {'X-MBX-APIKEY': self.api_key}
+        url = f"{self.BASE_URL}{endpoint}"
+        
+        try:
+            if method == 'GET':
+                res = self.session.get(url, params=signed_params, headers=headers, timeout=10)
+            elif method == 'POST':
+                res = self.session.post(url, params=signed_params, headers=headers, timeout=10)
+            elif method == 'DELETE':
+                res = self.session.delete(url, params=signed_params, headers=headers, timeout=10)
+            else:
+                raise ValueError(f"Unsupported method: {method}")
+            
+            res.raise_for_status()
+            return res.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"Binance API Error: {e} - {e.response.text if e.response else 'No response'}")
+            return {}
+        except Exception as e:
+            logger.error(f"Binance Request Failed: {e}")
+            return {}
 
     def normalize_symbol(self, symbol: str) -> str:
         """Normalize symbol to Binance format (e.g. XBTUSDTM -> BTCUSDT)"""
@@ -226,10 +269,10 @@ class BinanceAdapter(ExchangeProvider):
             return self.paper.get_positions()
         else:
             try:
-                # Fetch Live Positions
-                res = self.session.get(f"{self.BASE_URL}/fapi/v2/positionRisk", timeout=5)
-                res.raise_for_status()
-                data = res.json()
+                # Fetch Live Positions (Signed Request Required)
+                data = self._signed_request('GET', '/fapi/v2/positionRisk')
+                if not data:
+                    return []
                 
                 positions = []
                 for p in data:
@@ -245,7 +288,7 @@ class BinanceAdapter(ExchangeProvider):
                     lev = int(p.get('leverage', 1))
                     unrealized = float(p.get('unRealizedProfit', 0))
                     
-                    # Caclulate ROE% roughly if not provided
+                    # Calculate ROE% roughly if not provided
                     # PnL / Margin. Margin = (Entry * Size) / Lev
                     # This is approximate
                     margin = (abs(amt) * entry) / lev
@@ -272,21 +315,24 @@ class BinanceAdapter(ExchangeProvider):
             return self.paper.get_balance()
         else:
             try:
-                # Fetch Future Account Balance
-                res = self.session.get(f"{self.BASE_URL}/fapi/v2/balance", timeout=5)
-                res.raise_for_status()
-                data = res.json()
+                # Fetch Future Account Balance (Signed Request Required)
+                data = self._signed_request('GET', '/fapi/v2/balance')
+                if not data:
+                    return 0.0
                 
                 # Find USDT balance
                 for asset in data:
                     if asset['asset'] == currency:
-                        return float(asset['balance']) # or 'availableBalance'
+                        return float(asset.get('availableBalance', asset.get('balance', 0)))
                 return 0.0
             except Exception as e:
                 logger.error(f"Binance Live Balance Failed: {e}")
                 return 0.0
 
     def place_order(self, symbol: str, side: str, order_type: str, quantity: float, leverage: int, price: Optional[float] = None, reduce_only: bool = False) -> Dict:
+        # Normalize symbol
+        symbol = self.normalize_symbol(symbol)
+        
         # Get Price if Market
         exec_price = price
         if not exec_price:
@@ -295,17 +341,84 @@ class BinanceAdapter(ExchangeProvider):
         if self.is_paper:
             return self.paper.place_order(symbol, side, quantity, leverage, exec_price)
         else:
-            logger.warning("Binance Live Trading Not Implemented Yet")
-            return {}
+            # LIVE MODE: Execute on Binance Futures
+            try:
+                # 1. Set Leverage first
+                lev_params = {'symbol': symbol, 'leverage': leverage}
+                lev_res = self._signed_request('POST', '/fapi/v1/leverage', lev_params)
+                if not lev_res:
+                    logger.error(f"Failed to set leverage for {symbol}")
+                    # Continue anyway, might already be set
+                
+                # 2. Place Market Order
+                order_params = {
+                    'symbol': symbol,
+                    'side': side.upper(),  # BUY or SELL
+                    'type': 'MARKET',
+                    'quantity': quantity,
+                }
+                if reduce_only:
+                    order_params['reduceOnly'] = 'true'
+                
+                order_res = self._signed_request('POST', '/fapi/v1/order', order_params)
+                
+                if order_res and order_res.get('orderId'):
+                    logger.info(f"✅ Binance Order Placed: {side} {quantity} {symbol} @ Market (Lev: {leverage}x)")
+                    return order_res
+                else:
+                    logger.error(f"Binance Order Failed: {order_res}")
+                    return {}
+                    
+            except Exception as e:
+                logger.error(f"Binance Order Error: {e}")
+                return {}
 
     def close_position(self, symbol: str, size: Optional[float] = None) -> Dict:
+        # Normalize symbol
+        symbol = self.normalize_symbol(symbol)
         exec_price = self.get_current_price(symbol)
         
         if self.is_paper:
             return self.paper.close_position(symbol, exec_price)
         else:
-             logger.warning("Binance Live Closing Not Implemented Yet")
-             return {}
+            # LIVE MODE: Close position on Binance Futures
+            try:
+                # 1. Get current position to determine side and size
+                positions = self.get_open_positions()
+                target_pos = None
+                for p in positions:
+                    if self.normalize_symbol(p.symbol) == symbol:
+                        target_pos = p
+                        break
+                
+                if not target_pos:
+                    logger.warning(f"No open position found for {symbol}")
+                    return {}
+                
+                # 2. Close by placing opposite order
+                close_side = 'SELL' if target_pos.side == 'LONG' else 'BUY'
+                close_qty = size if size else target_pos.size
+                
+                order_params = {
+                    'symbol': symbol,
+                    'side': close_side,
+                    'type': 'MARKET',
+                    'quantity': close_qty,
+                    'reduceOnly': 'true',
+                }
+                
+                order_res = self._signed_request('POST', '/fapi/v1/order', order_params)
+                
+                if order_res and order_res.get('orderId'):
+                    logger.info(f"✅ Binance Position Closed: {close_side} {close_qty} {symbol} @ Market")
+                    return order_res
+                else:
+                    logger.error(f"Binance Close Failed: {order_res}")
+                    return {}
+                    
+            except Exception as e:
+                logger.error(f"Binance Close Error: {e}")
+                return {}
     
     def get_current_price(self, symbol: str) -> float:
         symbol = self.normalize_symbol(symbol)

@@ -18,6 +18,7 @@ from app.core.config import (
 # but let's be safe with absolute or relative to package.
 from app.models.Model_Sentinel.regime_classifier import RegimeClassifier
 from app.models.Model_Sentinel.harmonic_patterns import HarmonicDetector
+from app.models.Model_Sentinel.technical_patterns import TechnicalPatternDetector, PatternCategory
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,6 +33,11 @@ class TradingDecision:
     confidence: float
     recommendation: str
     reasoning: str
+    # Entry Discipline 6.0: Conditional Zones
+    entry_zone_low: float = 0.0
+    entry_zone_high: float = 0.0
+    stop_loss: float = 0.0
+    take_profit: float = 0.0
     
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -55,6 +61,12 @@ class DecisionEngine:
     def __init__(self):
         self.regime_classifier = RegimeClassifier()
         self.harmonic_detector = HarmonicDetector(error_tolerance=0.10)
+        
+        # [NEW] Technical Pattern Detector
+        self.technical_detector = TechnicalPatternDetector(
+            swing_lookback=config.technical_patterns.swing_lookback,
+            sr_tolerance_pct=config.technical_patterns.support_resistance_tolerance_pct
+        )
         
         # Thresholds from config
         self.min_quality = config.model.min_setup_quality
@@ -125,27 +137,69 @@ class DecisionEngine:
         # 3. Determine direction
         direction = self._determine_direction(df_classified, regime)
         
-        # [HARMONIC OVERRIDE] 
-        # Check for Strong Harmonic Patterns (Reversal Signals)
-        # These can OVERRIDE the trend bias or NONE bias.
+        # [PATTERN OVERRIDE LOGIC] 
+        # Priority: Harmonics > Technical Reversals > Breakouts > Continuations > Structure
+        pattern_override = False
+        
+        # Priority 1: HARMONIC PATTERNS (Highest Priority)
         try:
             harmonics = self.harmonic_detector.detect(df_classified)
             if harmonics:
                 best_pattern = max(harmonics, key=lambda p: p.confidence)
-                if best_pattern.confidence >= 0.7:
+                if best_pattern.confidence >= 0.85:  # RAISED from 0.70 to reduce false signals
                     logger.info(f"🎯 STRONG HARMONIC: {best_pattern.name} ({best_pattern.confidence:.2f}) -> Forcing Reversal")
                     
                     # Force Direction
                     direction = DirectionBias.LONG.value if best_pattern.bullish else DirectionBias.SHORT.value
                     
                     # Boost Quality (Pattern is the Setup)
-                    setup_quality = max(setup_quality + 0.3, 0.65) # Ensure it triggers trade
+                    setup_quality = max(setup_quality + 0.3, 0.65)
                     setup_quality = min(setup_quality, 1.0)
                     
                     # Force Regime annotation
                     regime = "HARMONIC_REVERSAL"
+                    pattern_override = True
         except Exception as e:
             logger.warning(f"Harmonic check failed: {e}")
+        
+        # Priority 2-5: TECHNICAL PATTERNS (if enabled and no harmonic override)
+        if not pattern_override and config.technical_patterns.enabled:
+            try:
+                tech_patterns = self.technical_detector.detect(df_classified)
+                if tech_patterns:
+                    # Get best pattern by category
+                    reversal_patterns = [p for p in tech_patterns if p.category == PatternCategory.REVERSAL]
+                    breakout_patterns = [p for p in tech_patterns if p.category == PatternCategory.BREAKOUT]
+                    continuation_patterns = [p for p in tech_patterns if p.category == PatternCategory.CONTINUATION]
+                    structure_patterns = [p for p in tech_patterns if p.category == PatternCategory.TREND]
+                    
+                    # Priority 2: Reversal Patterns
+                    if reversal_patterns:
+                        best = max(reversal_patterns, key=lambda p: p.confidence)
+                        if best.confidence >= config.technical_patterns.min_confidence_reversal:
+                            logger.info(f"📊 REVERSAL PATTERN: {best.name} ({best.confidence:.2f})")
+                            direction = DirectionBias.LONG.value if best.bullish else DirectionBias.SHORT.value
+                            setup_quality = max(setup_quality + 0.25, 0.60)
+                            setup_quality = min(setup_quality, 1.0)
+                            regime = f"TECH_REVERSAL_{best.name.upper().replace(' ', '_')}"
+                            pattern_override = True
+                    
+                    # Priority 3: Breakout Patterns
+                    if not pattern_override and breakout_patterns:
+                        best = max(breakout_patterns, key=lambda p: p.confidence)
+                        if best.confidence >= config.technical_patterns.min_confidence_breakout:
+                            logger.info(f"🚀 BREAKOUT PATTERN: {best.name} ({best.confidence:.2f})")
+                            direction = DirectionBias.LONG.value if best.bullish else DirectionBias.SHORT.value
+                            setup_quality = max(setup_quality + 0.20, 0.55)
+                            setup_quality = min(setup_quality, 1.0)
+                            pattern_override = True
+                    
+                    # Priority 4 & 5: DISABLED - Continuation and Structure patterns are too weak
+                    # They don't provide enough edge and cause random entries
+                    # Keeping only Harmonics (0.85+) and Reversals for precision
+                    pass
+            except Exception as e:
+                logger.warning(f"Technical pattern check failed: {e}")
 
         # [NEW] Directional Velocity Filter
         if direction == DirectionBias.LONG.value and rsi_slope < -10:
@@ -179,13 +233,79 @@ class DecisionEngine:
         if getattr(config.trading, 'strategy_mode', 'sniper') == 'scalp':
             return self.analyze_scalp(df, regime)
 
+        # ============================================
+        # ENTRY DISCIPLINE 6.0: Calculate Zones & SL/TP
+        # ============================================
+        entry_zone_low, entry_zone_high, stop_loss, take_profit = 0.0, 0.0, 0.0, 0.0
+        
+        if direction in [DirectionBias.LONG.value, DirectionBias.SHORT.value]:
+            try:
+                # Calculate EMA 20 and EMA 30 for Entry Zone
+                ema_20 = df_classified['close'].ewm(span=20, adjust=False).mean().iloc[-1]
+                ema_30 = df_classified['close'].ewm(span=30, adjust=False).mean().iloc[-1]
+                
+                current_price = df_classified['close'].iloc[-1]
+                
+                # Get recent swing levels (last 10 candles)
+                recent_lows = df_classified['low'].iloc[-10:]
+                recent_highs = df_classified['high'].iloc[-10:]
+                swing_low = recent_lows.min()
+                swing_high = recent_highs.max()
+                
+                # Last 3 candles for structural SL
+                last_3_lows = df_classified['low'].iloc[-3:]
+                last_3_highs = df_classified['high'].iloc[-3:]
+                
+                if direction == DirectionBias.LONG.value:
+                    # LONG: Entry Zone is EMA 20-30 (or swing low if price is above EMAs)
+                    entry_zone_low = min(ema_20, ema_30)
+                    entry_zone_high = max(ema_20, ema_30)
+                    
+                    # If price is already below EMA zone, use swing low area
+                    if current_price < entry_zone_low:
+                        entry_zone_low = swing_low * 0.998  # Slightly below swing
+                        entry_zone_high = swing_low * 1.002
+                    
+                    # SL: Below lowest low of last 3 candles + 0.1% buffer
+                    stop_loss = last_3_lows.min() * 0.999
+                    
+                    # TP: 2R minimum (R = Entry Zone Mid - SL)
+                    entry_mid = (entry_zone_low + entry_zone_high) / 2
+                    risk = entry_mid - stop_loss
+                    take_profit = entry_mid + (risk * 2)
+                    
+                else:  # SHORT
+                    # SHORT: Entry Zone is EMA 20-30 (from below)
+                    entry_zone_low = min(ema_20, ema_30)
+                    entry_zone_high = max(ema_20, ema_30)
+                    
+                    # If price is already above EMA zone, use swing high area
+                    if current_price > entry_zone_high:
+                        entry_zone_low = swing_high * 0.998
+                        entry_zone_high = swing_high * 1.002
+                    
+                    # SL: Above highest high of last 3 candles + 0.1% buffer
+                    stop_loss = last_3_highs.max() * 1.001
+                    
+                    # TP: 2R minimum
+                    entry_mid = (entry_zone_low + entry_zone_high) / 2
+                    risk = stop_loss - entry_mid
+                    take_profit = entry_mid - (risk * 2)
+                
+            except Exception as e:
+                logger.warning(f"Zone/SL calculation failed: {e}")
+
         return TradingDecision(
             market_state=regime,
             direction_bias=direction,
             setup_quality=round(setup_quality, 3),
             confidence=round(confidence, 3),
             recommendation=recommendation,
-            reasoning=reasoning
+            reasoning=reasoning,
+            entry_zone_low=round(entry_zone_low, 6),
+            entry_zone_high=round(entry_zone_high, 6),
+            stop_loss=round(stop_loss, 6),
+            take_profit=round(take_profit, 6)
         )
 
     def analyze_scalp(self, df: pd.DataFrame, regime: str) -> TradingDecision:
@@ -604,6 +724,10 @@ class DecisionEngine:
         if latest_close < ema_21 * 0.999: 
              if gate_short and is_red: return DirectionBias.SHORT.value
         
+        # [NEW] Bull Market Hail Mary (For Symmetry)
+        if latest_close > ema_21 * 1.001:
+             if gate_long and is_green: return DirectionBias.LONG.value
+        
         return DirectionBias.NONE.value
     
     def _calculate_confidence(
@@ -664,45 +788,36 @@ class DecisionEngine:
         """
         Generate recommendation and reasoning
         
-        Decision table:
-        | setup_quality | confidence | Recommendation |
-        |---------------|------------|----------------|
-        | < 0.4         | any        | NO_TRADE       |
-        | 0.4-0.5       | >= 0.6     | MICRO_TRADE    |
-        | 0.4-0.5       | < 0.6      | NO_TRADE       |
-        | >= 0.6        | >= 0.5     | ALLOW_TRADE    |
-        | >= 0.6        | < 0.5      | MICRO_TRADE    |
+        Uses config thresholds:
+        - min_setup_quality (default 0.60)
+        - min_confidence_allow (default 0.60)
         """
         latest = df.iloc[-1]
         reasons = []
+        
+        # Get thresholds from config (strict values for precision trading)
+        min_quality = config.model.min_setup_quality  # 0.60
+        min_confidence = config.model.min_confidence_allow  # 0.60
         
         # No direction = no trade
         if direction == DirectionBias.NONE.value:
             recommendation = Recommendation.NO_TRADE.value
             reasons.append("No clear directional bias")
         
-        # Low quality = no trade (using config threshold: 0.35)
-        elif setup_quality < self.min_quality:
+        # Setup quality below threshold = no trade
+        elif setup_quality < min_quality:
             recommendation = Recommendation.NO_TRADE.value
-            reasons.append(f"Setup quality too low ({setup_quality:.2f})")
+            reasons.append(f"Setup quality {setup_quality:.2f} below threshold ({min_quality})")
         
-        # Medium quality (0.35 - 0.5): Allow with decent confidence
-        elif setup_quality < 0.5:
-            if confidence >= 0.4:  # Lowered from 0.6
-                recommendation = Recommendation.MICRO_TRADE.value
-                reasons.append(f"Decent setup ({setup_quality:.2f})")
-            else:
-                recommendation = Recommendation.NO_TRADE.value
-                reasons.append(f"Marginal setup with low confidence ({confidence:.2f})")
+        # Good quality but low confidence = micro trade
+        elif confidence < min_confidence:
+            recommendation = Recommendation.MICRO_TRADE.value
+            reasons.append(f"Good setup ({setup_quality:.2f}) but low confidence ({confidence:.2f})")
         
-        # Good quality (>= 0.5): Full trade
+        # High quality + high confidence = ALLOW_TRADE
         else:
-            if confidence >= 0.4:  # Lowered from 0.5
-                recommendation = Recommendation.ALLOW_TRADE.value
-                reasons.append(f"Good setup ({setup_quality:.2f}) with confidence ({confidence:.2f})")
-            else:
-                recommendation = Recommendation.MICRO_TRADE.value
-                reasons.append(f"Good setup but reduced confidence ({confidence:.2f})")
+            recommendation = Recommendation.ALLOW_TRADE.value
+            reasons.append(f"Strong setup ({setup_quality:.2f}) with confidence ({confidence:.2f})")
         
         # Add regime context
         reasons.append(f"Regime: {regime}")

@@ -1,0 +1,2 @@
+Status: 200
+{"code":"200000","data":{"accountEquity":4.9395179514,"unrealisedPNL":0.0,"marginBalance":4.9395179514,"positionMargin":0.0,"orderMargin":0.0,"frozenFunds":0.0,"availableBalance":4.9395179514,"availableMargin":4.9395179514,"currency":"USDT","riskRatio":0.0,"maxWithdrawAmount":4.9395179514}}

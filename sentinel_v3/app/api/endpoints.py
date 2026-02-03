@@ -265,16 +265,18 @@ async def close_position(
     if not bot or not bot.exchange:
         raise HTTPException(status_code=404, detail=f"Bot not found for {exchange}")
     
-    # Get current price for close
     try:
-        current_price = bot.exchange.get_current_price(symbol)
-        if hasattr(bot.exchange, 'paper'):
-            result = bot.exchange.paper.close_position(symbol, current_price)
-        else:
-            bot.exchange.close_position(symbol)
-            result = {"status": "closed"}
+        # Always use the adapter's close_position (it handles Paper/Live internally)
+        logger.info(f"📤 Closing position: {symbol} on {exchange}")
+        result = bot.exchange.close_position(symbol)
         
-        return result
+        if result:
+            logger.info(f"✅ Position closed successfully: {symbol}")
+            return {"status": "closed", "symbol": symbol, "details": result}
+        else:
+            logger.warning(f"⚠️ Close returned empty result for {symbol}")
+            return {"status": "closed", "symbol": symbol}
+            
     except Exception as e:
         logger.error(f"Failed to close {symbol}: {e}")
         raise HTTPException(status_code=500, detail=str(e))

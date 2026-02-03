@@ -87,20 +87,22 @@ class TradingConfig:
     """Trading parameters"""
     # Trading pairs (Updated for Sniper Strategy)
     symbols: List[str] = field(default_factory=lambda: [
-        "XBTUSDTM",    # BTC
-        "ETHUSDTM",    # ETH
-        "SOLUSDTM",    # SOL
-        "XRPUSDTM",    # XRP
-        "DOGEUSDTM",   # DOGE
-        "ADAUSDTM",    # ADA
+        # Tier 1 (Majors)
+        "XBTUSDTM", "ETHUSDTM", "SOLUSDTM", "BNBUSDTM", "XRPUSDTM", "ADAUSDTM",
+        # Tier 2 (High Vol Alts)
+        "DOGEUSDTM", "AVAXUSDTM", "LINKUSDTM", "DOTUSDTM", "TRXUSDTM", "LTCUSDTM",
+        "MATICUSDTM", "SHIBUSDTM", "UNIUSDTM", "ATOMUSDTM", "XLMUSDTM", "ETCUSDTM",
+        # Tier 3 (New/Trending)
+        "FILUSDTM", "APTUSDTM", "ARBUSDTM", "OPUSDTM", "SUIUSDTM", "PEPEUSDTM",
+        "NEARUSDTM", "RNDRUSDTM", "INJUSDTM", "TIAUSDTM", "IMXUSDTM", "LDOUSDTM"
     ])
     
     # WebSocket Toggle (Enable for low latency)
     use_websockets: bool = True
     
     # Dynamic Watchlist
-    use_dynamic_watchlist: bool = True
-    watchlist_limit: int = 15  # Top N coins by volume
+    use_dynamic_watchlist: bool = False  # Disabled to enforce manual 30-coin list
+    watchlist_limit: int = 30  # Increased to match manual list size
     
     # Timeframes to analyze
     timeframes: List[Timeframe] = field(default_factory=lambda: [
@@ -133,7 +135,7 @@ class RiskConfig:
     max_risk_per_trade_pct: float = 1.5
     
     # Max daily loss (% of capital)
-    max_daily_loss: float = 4.0
+    max_daily_loss: float = 8.0
     
     # Max drawdown before pause (% of capital)
     max_drawdown: float = 8.0
@@ -141,27 +143,46 @@ class RiskConfig:
     # Max concurrent positions
     max_positions: int = 4
     
-    # Max leverage allowed (overridden by LEVERAGE_TIERS per symbol)
+    # Max leverage allowed (FIXED 10x for Daily Active Trading)
     max_leverage: int = 10
     
-    # Cooldown after loss (seconds)
-    loss_cooldown: int = 300
+    # Cooldown after loss (seconds) - 1 candle = 15 mins = 900s
+    loss_cooldown: int = 900
 
 
 @dataclass
 class ModelConfig:
     """Model parameters"""
-    # Minimum setup quality to consider trade (lowered for more trades)
-    min_setup_quality: float = 0.35
+    # Minimum setup quality to consider trade (STRICT for precision)
+    min_setup_quality: float = 0.60
     
-    # Minimum confidence for ALLOW_TRADE (lowered for more trades)
-    min_confidence_allow: float = 0.45
+    # Minimum confidence for ALLOW_TRADE (STRICT for precision)
+    min_confidence_allow: float = 0.60
     
     # Minimum confidence for MICRO_TRADE
     min_confidence_micro: float = 0.5
     
     # Lookback periods for features
     lookback_candles: int = 100
+
+
+@dataclass
+class TechnicalPatternConfig:
+    """Technical pattern detection parameters"""
+    # Enable/Disable technical patterns
+    enabled: bool = True
+    
+    # Minimum confidence thresholds by category
+    min_confidence_reversal: float = 0.75  # Higher bar for reversal patterns
+    min_confidence_continuation: float = 0.65
+    min_confidence_breakout: float = 0.70
+    min_confidence_structure: float = 0.60
+    
+    # Pattern-specific parameters
+    swing_lookback: int = 30  # Number of swings to track
+    trendline_min_r2: float = 0.85  # Regression fit threshold
+    support_resistance_tolerance_pct: float = 0.02  # 2% clustering tolerance
+
 
 
 @dataclass
@@ -202,6 +223,7 @@ class Config:
     trading: TradingConfig = field(default_factory=TradingConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    technical_patterns: TechnicalPatternConfig = field(default_factory=TechnicalPatternConfig)
     
     # Data storage
     data_dir: str = "./data_storage"
