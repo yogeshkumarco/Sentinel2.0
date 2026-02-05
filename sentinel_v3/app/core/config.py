@@ -148,6 +148,11 @@ class RiskConfig:
     
     # Cooldown after loss (seconds) - 1 candle = 15 mins = 900s
     loss_cooldown: int = 900
+    
+    # RUN_MODE Toggle (Bull/Bear Run Exploitation)
+    # When True, bot can switch to RUN_MODE during strong trends
+    # When False, bot stays in DAILY_ACTIVE mode only
+    enable_run_mode: bool = True
 
 
 @dataclass

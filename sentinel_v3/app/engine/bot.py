@@ -14,6 +14,7 @@ from app.exchanges.kucoin_adapter import KuCoinAdapter
 from app.exchanges.binance_adapter import BinanceAdapter
 from app.models.Model_Sentinel.decision_engine import DecisionEngine
 from app.engine.price_features import PriceFeatures
+from app.engine.run_mode_detector import RunModeDetector
 
 # Logging Setup: Force FileHandler to work (uvicorn hijack bypass)
 logger = logging.getLogger("SentinelBot")
@@ -64,11 +65,28 @@ class TradingBot:
         self.scan_symbols = settings.trading.symbols
         self.active_symbol = settings.trading.symbols[0] if settings.trading.symbols else "XBTUSDTM"
         
+        # ============================================
+        # RUN_MODE State (Isolated from Daily Active)
+        # ============================================
+        self.run_mode_detector = RunModeDetector()
+        self.current_mode = "DAILY_ACTIVE"  # "DAILY_ACTIVE" or "RUN_MODE"
+        self.run_mode_direction = "NONE"  # "BULL", "BEAR", or "NONE"
+        self.run_mode_state = {
+            'entry_count': 0,  # 0, 1, 2, or 3 (scaling entries)
+            'total_size': 0.0,  # Total position size built
+            'avg_entry': 0.0,  # Weighted average entry price
+            'tp1_hit': False,
+            'tp2_hit': False,
+            'activation_time': 0
+        }
+        
         # Brain Persistence: Load previous state if exists
         self._load_state()
         
         logger.info(f"🤖 {exchange_name.upper()} Bot initialized")
         logger.info(f"🛡️ ENTRY DISCIPLINE 6.0: ACTIVE (Conditional Zones + Structural SL)")
+        if settings.risk.enable_run_mode:
+            logger.info(f"🚀 RUN_MODE: ENABLED (Bull/Bear Run Exploitation available)")
 
     def _save_state(self):
         """Save position state to disk for persistence across restarts"""
@@ -162,9 +180,19 @@ class TradingBot:
                     open_positions = self.exchange.get_open_positions()
                     open_symbols = {p.symbol for p in open_positions}
                     
+                    # ============================================
+                    # RUN_MODE CHECK (Isolated from Daily Active)
+                    # ============================================
+                    if settings.risk.enable_run_mode:
+                        self._check_run_mode_status()
+                    
+                    # Route to appropriate entry logic based on mode
                     for symbol in self.scan_symbols:
                         if symbol not in open_symbols:
-                            self._check_entry(symbol)
+                            if self.current_mode == "RUN_MODE":
+                                self._check_entry_run_mode(symbol)
+                            else:
+                                self._check_entry(symbol)  # Daily Active (unchanged)
                     
                     # 2c. Process Pending Setups (Conditional Entries)
                     self._process_pending_setups(open_symbols)
@@ -358,7 +386,15 @@ class TradingBot:
             trade_age_minutes = (time.time() - state['entry_time']) / 60
             
             # ============================================
+            # RUN_MODE EXIT ROUTING (Isolated)
+            # ============================================
+            if state.get('is_run_mode') and self.current_mode == "RUN_MODE":
+                self._manage_positions_run_mode(symbol, pos)
+                continue  # Skip Daily Active exit logic
+            
+            # ============================================
             # 3-MODE EXIT SYSTEM (Candle-Close Only)
+            # Daily Active Mode (unchanged)
             # ============================================
             
             # 1️⃣ HARD STOP (ALWAYS ACTIVE - Tick Based)
@@ -606,20 +642,15 @@ class TradingBot:
                      h1_bullish = price_h1 > ema_55
                      
                      if decision.direction_bias == "SHORT" and h1_bullish:
-                         # Soft Gate: Allow if confidence is high (Sniper Reversal)
-                         if decision.confidence >= 0.80:
-                             logger.info(f"⚠️ HTF MISMATCH: {symbol} Short vs Bull Trend. ALLOWED due to High Confidence ({decision.confidence:.2f})")
-                         else:
-                             logger.info(f"🛑 HTF MISMATCH: {symbol} Signal SHORT vs Bull Trend. Blocked (Conf {decision.confidence:.2f} < 0.75)")
-                             return
+                         # STRICT HTF RULE: No counter-trend shorts in Daily Active
+                         # Unless RUN_MODE is active (which has its own entry logic, so this path is Daily Only)
+                         logger.info(f"🛑 HTF MISMATCH: {symbol} Signal SHORT vs Bull Trend. STRICTLY BLOCKED.")
+                         return
                          
                      if decision.direction_bias == "LONG" and not h1_bullish:
-                         # Soft Gate: Allow if confidence is high (Sniper Reversal)
-                         if decision.confidence >= 0.80:
-                             logger.info(f"⚠️ HTF MISMATCH: {symbol} Long vs Bear Trend. ALLOWED due to High Confidence ({decision.confidence:.2f})")
-                         else:
-                             logger.info(f"🛑 HTF MISMATCH: {symbol} Signal LONG vs Bear Trend. Blocked (Conf {decision.confidence:.2f} < 0.80)")
-                             return
+                         # STRICT HTF RULE: No counter-trend longs in Daily Active
+                         logger.info(f"🛑 HTF MISMATCH: {symbol} Signal LONG vs Bear Trend. STRICTLY BLOCKED.")
+                         return
                          
                      logger.info(f"✅ HTF CONFIRMED: H1 Trend aligns with {decision.direction_bias}")
              except Exception as e:
@@ -811,3 +842,288 @@ class TradingBot:
             else:
                 del self.cooldowns[symbol]
         return False
+
+    # ============================================
+    # RUN_MODE METHODS (Isolated from Daily Active)
+    # Bull/Bear Run Exploitation System
+    # ============================================
+    
+    def _check_run_mode_status(self):
+        """
+        Check if RUN_MODE should activate or deactivate.
+        Called every scan cycle. Mode switching is logged.
+        """
+        try:
+            # Get HTF data for detector
+            # Use first symbol for market-wide trend check
+            primary_symbol = self.scan_symbols[0] if self.scan_symbols else "XBTUSDTM"
+            
+            df_15m = self.exchange.get_market_structure(primary_symbol, settings.trading.primary_timeframe)
+            df_1h = self.exchange.get_market_structure(primary_symbol, "1h")
+            
+            if df_15m is None or df_15m.empty or df_1h is None or df_1h.empty:
+                return
+            
+            if self.current_mode == "DAILY_ACTIVE":
+                # Check for activation
+                is_active, direction, metrics = self.run_mode_detector.check_activation(df_15m, df_1h)
+                
+                if is_active and direction in ["BULL", "BEAR"]:
+                    self.current_mode = "RUN_MODE"
+                    self.run_mode_direction = direction
+                    self.run_mode_state = {
+                        'entry_count': 0,
+                        'total_size': 0.0,
+                        'avg_entry': 0.0,
+                        'tp1_hit': False,
+                        'tp2_hit': False,
+                        'activation_time': time.time()
+                    }
+                    logger.info(f"🚀 RUN_MODE_ENTERED | {direction} | Conf={metrics.get('confidence', 0)} | ATR={metrics.get('atr_ratio', 0)}")
+                    
+            elif self.current_mode == "RUN_MODE":
+                # Check for exit conditions
+                should_exit, reason = self.run_mode_detector.check_exit_conditions(
+                    df_15m, df_1h, self.run_mode_direction
+                )
+                
+                if should_exit:
+                    self._reset_run_mode(reason)
+                    
+        except Exception as e:
+            logger.warning(f"RUN_MODE status check error: {e}")
+    
+    def _reset_run_mode(self, reason: str):
+        """Reset to DAILY_ACTIVE mode"""
+        logger.info(f"🛑 RUN_MODE_EXITED | Reason: {reason}")
+        self.current_mode = "DAILY_ACTIVE"
+        self.run_mode_direction = "NONE"
+        self.run_mode_state = {
+            'entry_count': 0,
+            'total_size': 0.0,
+            'avg_entry': 0.0,
+            'tp1_hit': False,
+            'tp2_hit': False,
+            'activation_time': 0
+        }
+    
+    def _check_entry_run_mode(self, symbol: str):
+        """
+        RUN_MODE Entry Logic (Isolated)
+        - ONLY pullback-continuation entries in trend direction
+        - NO wick fades, NO mid-range scalps
+        - Position scaling: 40% / 30% / 30%
+        """
+        # Check cooldown
+        if self._is_cooldown(symbol):
+            return
+        
+        # Already at max entries for this run?
+        if self.run_mode_state['entry_count'] >= 3:
+            return
+        
+        try:
+            df = self.exchange.get_market_structure(symbol, settings.trading.primary_timeframe)
+            if df.empty or len(df) < 50:
+                return
+            
+            # Use closed candles
+            df = df.iloc[:-1]
+            latest = df.iloc[-1]
+            current_price = latest['close']
+            
+            # Calculate EMA for pullback detection
+            df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
+            df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
+            ema_20 = df['ema_20'].iloc[-1]
+            ema_50 = df['ema_50'].iloc[-1]
+            
+            # Determine entry type based on entry count
+            entry_num = self.run_mode_state['entry_count'] + 1
+            valid_entry = False
+            entry_reason = ""
+            
+            if self.run_mode_direction == "BULL":
+                # BULL RUN: Look for pullbacks to EMA
+                price_above_ema50 = current_price > ema_50
+                pullback_to_ema20 = current_price <= ema_20 * 1.005  # Within 0.5% of EMA20
+                
+                # Bullish candle confirmation
+                is_bullish = latest['close'] > latest['open']
+                lower_wick = min(latest['open'], latest['close']) - latest['low']
+                candle_range = latest['high'] - latest['low']
+                wick_rejection = (lower_wick / candle_range >= 0.25) if candle_range > 0 else False
+                
+                if entry_num == 1:
+                    # Entry 1: First pullback to EMA20
+                    valid_entry = price_above_ema50 and pullback_to_ema20 and is_bullish and wick_rejection
+                    entry_reason = "First pullback to EMA20"
+                elif entry_num == 2:
+                    # Entry 2: Second pullback (higher low)
+                    prev_low = df['low'].iloc[-10:-1].min()
+                    higher_low = latest['low'] > prev_low
+                    valid_entry = price_above_ema50 and is_bullish and higher_low
+                    entry_reason = "Second pullback (higher low)"
+                elif entry_num == 3:
+                    # Entry 3: Continuation break
+                    recent_high = df['high'].iloc[-10:-1].max()
+                    break_high = current_price > recent_high
+                    valid_entry = break_high and is_bullish
+                    entry_reason = "Continuation break"
+                    
+            elif self.run_mode_direction == "BEAR":
+                # BEAR RUN: Look for rallies to EMA
+                price_below_ema50 = current_price < ema_50
+                rally_to_ema20 = current_price >= ema_20 * 0.995  # Within 0.5% of EMA20
+                
+                # Bearish candle confirmation
+                is_bearish = latest['close'] < latest['open']
+                upper_wick = latest['high'] - max(latest['open'], latest['close'])
+                candle_range = latest['high'] - latest['low']
+                wick_rejection = (upper_wick / candle_range >= 0.25) if candle_range > 0 else False
+                
+                if entry_num == 1:
+                    valid_entry = price_below_ema50 and rally_to_ema20 and is_bearish and wick_rejection
+                    entry_reason = "First rally to EMA20"
+                elif entry_num == 2:
+                    prev_high = df['high'].iloc[-10:-1].max()
+                    lower_high = latest['high'] < prev_high
+                    valid_entry = price_below_ema50 and is_bearish and lower_high
+                    entry_reason = "Second rally (lower high)"
+                elif entry_num == 3:
+                    recent_low = df['low'].iloc[-10:-1].min()
+                    break_low = current_price < recent_low
+                    valid_entry = break_low and is_bearish
+                    entry_reason = "Continuation break"
+            
+            if valid_entry:
+                self._scale_entry(symbol, entry_num, entry_reason, current_price)
+                
+        except Exception as e:
+            logger.warning(f"RUN_MODE entry check error for {symbol}: {e}")
+    
+    def _scale_entry(self, symbol: str, entry_num: int, reason: str, price: float):
+        """
+        Execute scaled entry for RUN_MODE
+        Entry 1: 40%, Entry 2: 30%, Entry 3: 30%
+        """
+        try:
+            balance = self.exchange.get_balance()
+            if balance < 10:
+                return
+            
+            # Determine size based on entry number
+            if entry_num == 1:
+                size_pct = 0.40
+            else:
+                size_pct = 0.30
+            
+            margin_amt = balance * size_pct * 0.95  # 95% of allocated portion
+            leverage = settings.risk.max_leverage
+            
+            side = "LONG" if self.run_mode_direction == "BULL" else "SHORT"
+            
+            notional_value = margin_amt * leverage
+            qty = round(notional_value / price, 6)
+            
+            logger.info(f"📈 RUN_MODE_ENTRY_{entry_num} | {symbol} {side} | {reason}")
+            logger.info(f"   📐 Size: {size_pct*100:.0f}% (${margin_amt:.2f}) x {leverage}x = {qty:.6f}")
+            
+            res = self.exchange.place_order(symbol, side, 'market', qty, leverage)
+            
+            if res:
+                # Update RUN_MODE state
+                self.run_mode_state['entry_count'] = entry_num
+                old_total = self.run_mode_state['total_size']
+                new_total = old_total + qty
+                
+                # Update weighted average entry
+                if new_total > 0:
+                    old_avg = self.run_mode_state['avg_entry']
+                    self.run_mode_state['avg_entry'] = (old_avg * old_total + price * qty) / new_total
+                else:
+                    self.run_mode_state['avg_entry'] = price
+                    
+                self.run_mode_state['total_size'] = new_total
+                
+                # Initialize position state for exit tracking
+                if symbol not in self.pos_state:
+                    self.pos_state[symbol] = {
+                        'peak_pnl': 0,
+                        'entry_time': time.time(),
+                        'is_run_mode': True,  # Flag for RUN_MODE exit logic
+                        'trade_id': f"RUN-{int(time.time())}"
+                    }
+                
+                self._set_cooldown(symbol, settings.risk.loss_cooldown, f"RUN_MODE Entry {entry_num}")
+                
+        except Exception as e:
+            logger.error(f"RUN_MODE scale entry error: {e}")
+    
+    def _manage_positions_run_mode(self, symbol: str, pos):
+        """
+        RUN_MODE Exit Logic (Called from _manage_positions)
+        - Fee Gate remains active
+        - Partial TPs: 25% at TP1, 25% at TP2, 50% runner
+        - Structure-based trailing for runner
+        """
+        pnl_pct = pos.pnl_pct
+        state = self.pos_state.get(symbol, {})
+        
+        # Track peak PnL
+        if pnl_pct > state.get('peak_pnl', 0):
+            state['peak_pnl'] = pnl_pct
+            self.pos_state[symbol] = state
+        
+        # Fee Gate (UNCHANGED - still active)
+        if pnl_pct < 1.8 and pnl_pct > -15.0:
+            return  # Block exits in fee zone
+        
+        # TP1: 25% at +2.5% (local extension)
+        if not self.run_mode_state['tp1_hit'] and pnl_pct >= 2.5:
+            self._partial_exit(symbol, 0.25, "TP1_LOCAL_EXTENSION", pnl_pct)
+            self.run_mode_state['tp1_hit'] = True
+            logger.info(f"💰 RUN_MODE_PARTIAL_EXIT | TP1 | {symbol} | {pnl_pct:.2f}%")
+            return
+        
+        # TP2: 25% at +4.0% (HTF target)
+        if not self.run_mode_state['tp2_hit'] and pnl_pct >= 4.0:
+            self._partial_exit(symbol, 0.25, "TP2_HTF_TARGET", pnl_pct)
+            self.run_mode_state['tp2_hit'] = True
+            logger.info(f"💰 RUN_MODE_PARTIAL_EXIT | TP2 | {symbol} | {pnl_pct:.2f}%")
+            return
+        
+        # Runner (50%): Structure-based trailing
+        if self.run_mode_state['tp2_hit']:
+            if not state.get('runner_active'):
+                state['runner_active'] = True
+                logger.info(f"🏃 RUN_MODE_RUNNER_ACTIVE | {symbol} | Trailing structure")
+            
+            # Emergency trail at 1.2% from peak (hard protection)
+            trailing_level = state['peak_pnl'] - 1.2
+            if pnl_pct <= trailing_level:
+                logger.info(f"🏃 RUNNER_EXIT | {symbol} | Peak:{state['peak_pnl']:.2f}% -> {pnl_pct:.2f}%")
+                self._close(symbol, "RUN_MODE Runner Exit", pnl_pct)
+                self._reset_run_mode("RUNNER_CLOSED")
+    
+    def _partial_exit(self, symbol: str, pct: float, reason: str, pnl_pct: float):
+        """
+        Close a percentage of position
+        """
+        try:
+            positions = self.exchange.get_open_positions()
+            pos = next((p for p in positions if p.symbol == symbol), None)
+            
+            if pos is None:
+                return
+            
+            close_qty = round(pos.qty * pct, 6)
+            
+            # Close partial via market order in opposite direction
+            close_side = "SHORT" if pos.side.upper() == "LONG" else "LONG"
+            
+            logger.info(f"   📤 Partial Close: {pct*100:.0f}% ({close_qty}) | {reason}")
+            self.exchange.place_order(symbol, close_side, 'market', close_qty, 1)
+            
+        except Exception as e:
+            logger.warning(f"Partial exit error: {e}")
