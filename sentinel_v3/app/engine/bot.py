@@ -15,6 +15,8 @@ from app.exchanges.binance_adapter import BinanceAdapter
 from app.models.Model_Sentinel.decision_engine import DecisionEngine
 from app.engine.price_features import PriceFeatures
 from app.engine.run_mode_detector import RunModeDetector
+from app.engine.pattern_engine import PatternEngine
+from app.engine.chop_detector import ChopDetector
 
 # Logging Setup: Force FileHandler to work (uvicorn hijack bypass)
 logger = logging.getLogger("SentinelBot")
@@ -80,11 +82,23 @@ class TradingBot:
             'activation_time': 0
         }
         
+        # ============================================
+        # PATTERN EXECUTION LAYER (VETO Power)
+        # ============================================
+        self.pattern_engine = PatternEngine()
+        
+        # ============================================
+        # ADAPTIVE TIMEFRAME (Chop Detection)
+        # ============================================
+        self.chop_detector = ChopDetector()
+        self.current_market_mode = None  # Cache for logging
+        
         # Brain Persistence: Load previous state if exists
         self._load_state()
         
         logger.info(f"🤖 {exchange_name.upper()} Bot initialized")
         logger.info(f"🛡️ ENTRY DISCIPLINE 6.0: ACTIVE (Conditional Zones + Structural SL)")
+        logger.info(f"📐 PATTERN LAYER: ACTIVE (Swing-based execution with Proof-of-Move)")
         if settings.risk.enable_run_mode:
             logger.info(f"🚀 RUN_MODE: ENABLED (Bull/Bear Run Exploitation available)")
 
@@ -507,6 +521,146 @@ class TradingBot:
             except Exception as e:
                 logger.warning(f"Exit logic error for {symbol}: {e}")
 
+    # ============================================
+    # CHANGE 1: TRADE TYPE CLASSIFICATION METHOD
+    # Determines if trade is CONTINUATION, REACTION, or RANGE
+    # ============================================
+    def _classify_trade_type(self, df, direction_bias: str, high_impulse: bool = False) -> str:
+        """
+        Classify trade type based on market structure.
+        
+        Types:
+        - CONTINUATION: Trend following (pullbacks, flags)
+        - REACTION: Counter-trend (V-reversals, failed breakdowns)
+        - RANGE: Mean reversion (support/resistance bounces)
+        
+        Returns:
+            str: "CONTINUATION", "REACTION", or "RANGE"
+        """
+        try:
+            if len(df) < 20:
+                return "CONTINUATION"  # Default
+            
+            # Calculate structure metrics
+            recent_high = df['high'].iloc[-20:].max()
+            recent_low = df['low'].iloc[-20:].min()
+            current_price = df['close'].iloc[-1]
+            range_size = recent_high - recent_low
+            
+            if range_size == 0:
+                return "CONTINUATION"
+            
+            # Position in range (0 = at low, 1 = at high)
+            position_in_range = (current_price - recent_low) / range_size
+            
+            # Check for trending structure (higher highs or lower lows)
+            highs = df['high'].iloc[-10:]
+            lows = df['low'].iloc[-10:]
+            
+            higher_highs = sum(highs.iloc[i] > highs.iloc[i-1] for i in range(1, len(highs)))
+            lower_lows = sum(lows.iloc[i] < lows.iloc[i-1] for i in range(1, len(lows)))
+            
+            trending_up = higher_highs >= 6
+            trending_down = lower_lows >= 6
+            
+            # ATR check for volatility context
+            avg_range = (df['high'] - df['low']).iloc[-10:].mean()
+            current_range = df['high'].iloc[-1] - df['low'].iloc[-1]
+            vol_expansion = current_range > avg_range * 1.5
+            
+            # Classification Logic:
+            
+            # 1. HIGH_IMPULSE + Reversal candle = REACTION
+            if high_impulse:
+                # Check for rejection wick (potential reversal)
+                latest = df.iloc[-1]
+                candle_range = latest['high'] - latest['low']
+                if candle_range > 0:
+                    if direction_bias == "LONG":
+                        lower_wick = min(latest['open'], latest['close']) - latest['low']
+                        wick_ratio = lower_wick / candle_range
+                        if wick_ratio > 0.40:  # Strong lower wick rejection
+                            return "REACTION"
+                    elif direction_bias == "SHORT":
+                        upper_wick = latest['high'] - max(latest['open'], latest['close'])
+                        wick_ratio = upper_wick / candle_range
+                        if wick_ratio > 0.40:  # Strong upper wick rejection
+                            return "REACTION"
+            
+            # 2. Trending structure + pullback = CONTINUATION
+            if direction_bias == "LONG" and trending_up:
+                # Pullback: price is in lower half of range but trend is up
+                if position_in_range < 0.5:
+                    return "CONTINUATION"
+            elif direction_bias == "SHORT" and trending_down:
+                # Pullback: price is in upper half of range but trend is down
+                if position_in_range > 0.5:
+                    return "CONTINUATION"
+            
+            # 3. Price at extremes of range = RANGE trade
+            if position_in_range < 0.25 or position_in_range > 0.75:
+                # At support/resistance in a non-trending market
+                if not trending_up and not trending_down:
+                    return "RANGE"
+            
+            # 4. Default to CONTINUATION for unclear cases
+            return "CONTINUATION"
+            
+        except Exception as e:
+            logger.warning(f"Trade type classification error: {e}")
+            return "CONTINUATION"  # Safe default
+
+    # ============================================
+    # CHANGE 6: CONFIRMATION & DISPLACEMENT CANDLE CHECKS
+    # Two-stage entry: Confirm -> Arm, Displacement -> Trigger
+    # ============================================
+    
+    def _check_confirmation_candle(self, df, direction: str) -> bool:
+        """
+        Check for confirmation candle (Stage 1: ARMS the trade).
+        
+        LONG: Bullish close above prior close
+        SHORT: Bearish close below prior close
+        """
+        if len(df) < 2:
+            return False
+        
+        latest = df.iloc[-1]
+        prior = df.iloc[-2]
+        
+        if direction == "LONG":
+            # Bullish confirmation: close > open AND close > prior close
+            return latest['close'] > latest['open'] and latest['close'] > prior['close']
+        else:
+            # Bearish confirmation: close < open AND close < prior close
+            return latest['close'] < latest['open'] and latest['close'] < prior['close']
+    
+    def _check_displacement_candle(self, df, direction: str) -> bool:
+        """
+        Check for displacement candle (Stage 2: TRIGGERS entry).
+        
+        Displacement = Strong directional move (body > 1.2x average)
+        """
+        if len(df) < 10:
+            return False
+        
+        latest = df.iloc[-1]
+        body_size = abs(latest['close'] - latest['open'])
+        
+        # Calculate average body size over last 10 candles
+        bodies = abs(df['close'].iloc[-10:] - df['open'].iloc[-10:])
+        avg_body = bodies.mean()
+        
+        # Displacement requires body > 1.2x average
+        is_displacement = body_size > (avg_body * 1.2)
+        
+        if direction == "LONG":
+            correct_direction = latest['close'] > latest['open']
+        else:
+            correct_direction = latest['close'] < latest['open']
+        
+        return is_displacement and correct_direction
+
 
     def _check_entry(self, symbol: str):
         """Analyze market for entry"""
@@ -523,10 +677,33 @@ class TradingBot:
         if any(p.symbol == symbol for p in positions):
             return
 
-        # Get Data
-        df = self.exchange.get_market_structure(symbol, settings.trading.primary_timeframe)
+        # Get 15m Data (always needed for chop detection)
+        df_15m = self.exchange.get_market_structure(symbol, "15m")
+        if df_15m is None or df_15m.empty or len(df_15m) < 50:
+            logger.warning(f"⚠️ Insufficient data for {symbol}: {len(df_15m) if df_15m is not None else 0} candles")
+            return
+
+        # ============================================
+        # ADAPTIVE TIMEFRAME: Detect market mode
+        # ============================================
+        market_mode = self.chop_detector.detect(df_15m)
+        
+        # Log mode changes (only when mode changes)
+        if self.current_market_mode != market_mode.mode:
+            logger.info(f"📊 MARKET_MODE | {market_mode.mode} | ATR_Ratio={market_mode.atr_ratio:.2f} | ADX={market_mode.adx:.1f} | BB_Width={market_mode.bb_width_pct:.1f}%")
+            self.current_market_mode = market_mode.mode
+        
+        # Select timeframe based on market mode
+        if market_mode.mode == "CHOPPY":
+            # Fetch 5m data for entries in choppy markets
+            df = self.exchange.get_market_structure(symbol, "5m")
+            if df is None or df.empty or len(df) < 50:
+                df = df_15m  # Fallback to 15m
+        else:
+            df = df_15m
+
         if df.empty or len(df) < 50:
-            logger.warning(f"⚠️ Insufficient data for {symbol}: {len(df)} candles")
+            logger.warning(f"⚠️ Insufficient data for {symbol}")
             return
 
         # ============================================
@@ -588,13 +765,38 @@ class TradingBot:
                     logger.info(f"🚫 ENTRY_BLOCKED | LATE_ENTRY_EXHAUSTION | {symbol} | Impulse={impulse_move_pct:.1f}% | Body:{body_shrinking} Vol:{volume_declining} Extreme:{near_extreme} RangeNarrow:{range_narrowing}")
                     return
                 
-            # Original Impulse Filter (Block during active impulse)
+            # ============================================
+            # CHANGE 2: HIGH_IMPULSE TAG (Not a hard block)
+            # Instead of blocking, tag asset as REACTION candidate
+            # ============================================
             recent_high = df['high'].iloc[-10:].max()
             recent_low = df['low'].iloc[-10:].min()
             recent_move_pct = (recent_high - recent_low) / recent_low * 100
-            if recent_move_pct > 6.0:  # Relaxed from 5.0%
-                logger.info(f"⚠️ IMPULSE_FILTER | {symbol} moved {recent_move_pct:.1f}% in last 10 candles. Skipping entry.")
-                return
+            high_impulse = recent_move_pct > 6.0
+            
+            if high_impulse:
+                logger.info(f"⚡ HIGH_IMPULSE_TAG | {symbol} moved {recent_move_pct:.1f}% | REACTION candidate only")
+                # Continue with trade_type = REACTION (set below)
+        
+        # ============================================
+        # PATTERN-BASED OVERRIDE (For REACTION Trades)
+        # Run pattern engine EARLY for HIGH_IMPULSE coins
+        # REACTION patterns can override NO_TRADE
+        # ============================================
+        pattern_override = False
+        early_pattern = None
+        if 'high_impulse' in dir() and high_impulse:
+            early_pattern = self.pattern_engine.analyze(
+                df=df,
+                direction_bias=None,  # Let pattern engine decide direction
+                htf_trend=None,
+                run_mode=False
+            )
+            
+            # REACTION patterns can override NO_TRADE
+            if early_pattern.family == "REACTION" and early_pattern.score >= 0.50:
+                pattern_override = True
+                logger.info(f"⚡ PATTERN_OVERRIDE | {symbol} | {early_pattern.variant} (Score={early_pattern.score:.2f}) found")
 
         # ============================================
         # NO-TRADE ZONE FILTER (Mid-Range Chop Protection)
@@ -614,9 +816,9 @@ class TradingBot:
             
             # Only apply if range is meaningful (> 0.5% of price)
             if range_size > (support * 0.005):
-                # Define No-Trade Zone (Middle 30% of range)
-                no_trade_low = support + (range_size * 0.35)
-                no_trade_high = resistance - (range_size * 0.35)
+                # Define No-Trade Zone (Middle 10% of range - Relaxed from 30%)
+                no_trade_low = support + (range_size * 0.45)
+                no_trade_high = resistance - (range_size * 0.45)
                 
                 # Check if price is inside No-Trade Zone
                 if no_trade_low < current_price < no_trade_high:
@@ -627,8 +829,60 @@ class TradingBot:
         # Analyze
         decision = self.decision_engine.analyze(df)
         
-        # HTF TREND FILTER (1H Alignment) 🛡️
-        # Prevent Shorting into Bull Trend or Longing into Bear Trend
+        # ============================================
+        # PATTERN-BASED DECISION OVERRIDE
+        # REACTION patterns can override NO_TRADE
+        # ============================================
+        if pattern_override and decision.recommendation == 'NO_TRADE':
+            # Determine direction from pattern and candle
+            override_direction = "LONG" if df['close'].iloc[-1] > df['open'].iloc[-1] else "SHORT"
+            decision.recommendation = 'MICRO_TRADE'  # Use smaller size for safety
+            decision.direction_bias = override_direction
+            decision.confidence = early_pattern.score  # Use pattern score as confidence
+            decision.entry_zone_low = early_pattern.sl_zone[0] if early_pattern.sl_zone else df['low'].iloc[-1]
+            decision.entry_zone_high = df['close'].iloc[-1]
+            decision.stop_loss = early_pattern.sl_zone[1] if early_pattern.sl_zone else df['low'].iloc[-3:].min()
+            decision.take_profit = early_pattern.tp_zone[0] if early_pattern.tp_zone else df['close'].iloc[-1] * 1.02
+            logger.info(f"🔄 DECISION_OVERRIDE | {symbol} | NO_TRADE -> MICRO_TRADE | Dir={override_direction} | Pattern={early_pattern.variant}")
+        
+        # ============================================
+        # CHANGE 1: TRADE TYPE CLASSIFICATION
+        # Classify trade type EARLY in the pipeline
+        # Types: CONTINUATION, REACTION, RANGE
+        # ============================================
+        trade_type = self._classify_trade_type(df, decision.direction_bias, high_impulse if 'high_impulse' in dir() else False)
+        logger.info(f"📊 TRADE_TYPE | {symbol} | {trade_type}")
+        
+        # ============================================
+        # CHANGE 3: CONDITIONAL CONFIDENCE THRESHOLDS
+        # Different thresholds per trade type & market mode
+        # ============================================
+        if self.current_market_mode == "CHOPPY":
+            # Loose thresholds for scalping in chop
+            confidence_thresholds = {
+                "CONTINUATION": 0.45,  # Much lower for 5m scalps
+                "REACTION": 0.40,
+                "RANGE": 0.40
+            }
+        else:
+            # Strict thresholds for trending moves
+            confidence_thresholds = {
+                "CONTINUATION": 0.60,
+                "REACTION": 0.52,
+                "RANGE": 0.55
+            }
+        
+        min_confidence = confidence_thresholds.get(trade_type, 0.50)
+        
+        if decision.recommendation in ['ALLOW_TRADE', 'MICRO_TRADE'] and decision.confidence < min_confidence:
+            logger.info(f"🚫 LOW_CONFIDENCE | {symbol} | {trade_type} requires {min_confidence}, got {decision.confidence:.2f}")
+            return
+        
+        # ============================================
+        # CHANGE 4: HTF TREND FILTER (Type-Aware)
+        # Strict enforcement ONLY for CONTINUATION trades
+        # REACTION trades bypass HTF veto
+        # ============================================
         if decision.recommendation in ['ALLOW_TRADE', 'MICRO_TRADE']:
              try:
                  df_h1 = self.exchange.get_market_structure(symbol, "1h")
@@ -641,24 +895,29 @@ class TradingBot:
                      
                      h1_bullish = price_h1 > ema_55
                      
-                     if decision.direction_bias == "SHORT" and h1_bullish:
-                         # STRICT HTF RULE: No counter-trend shorts in Daily Active
-                         # Unless RUN_MODE is active (which has its own entry logic, so this path is Daily Only)
-                         logger.info(f"🛑 HTF MISMATCH: {symbol} Signal SHORT vs Bull Trend. STRICTLY BLOCKED.")
-                         return
-                         
-                     if decision.direction_bias == "LONG" and not h1_bullish:
-                         # STRICT HTF RULE: No counter-trend longs in Daily Active
-                         logger.info(f"🛑 HTF MISMATCH: {symbol} Signal LONG vs Bear Trend. STRICTLY BLOCKED.")
-                         return
-                         
-                     logger.info(f"✅ HTF CONFIRMED: H1 Trend aligns with {decision.direction_bias}")
+                     if trade_type == "CONTINUATION":
+                         # STRICT HTF enforcement for CONTINUATION trades only
+                         if decision.direction_bias == "SHORT" and h1_bullish:
+                             logger.info(f"🛑 HTF MISMATCH: {symbol} CONTINUATION SHORT vs Bull Trend. BLOCKED.")
+                             return
+                         if decision.direction_bias == "LONG" and not h1_bullish:
+                             logger.info(f"🛑 HTF MISMATCH: {symbol} CONTINUATION LONG vs Bear Trend. BLOCKED.")
+                             return
+                         logger.info(f"✅ HTF CONFIRMED: H1 Trend aligns with {decision.direction_bias}")
+                     elif trade_type == "REACTION":
+                         # HTF veto IGNORED for REACTION trades
+                         logger.info(f"⚡ HTF BYPASS | {symbol} | REACTION trade, HTF veto ignored")
+                     else:
+                         # RANGE trades: soft warning but allow
+                         if (decision.direction_bias == "SHORT" and h1_bullish) or \
+                            (decision.direction_bias == "LONG" and not h1_bullish):
+                             logger.info(f"⚠️ HTF SOFT_WARN | {symbol} | RANGE trade against HTF, proceeding with caution")
              except Exception as e:
                  logger.warning(f"HTF Check failed for {symbol}: {e}. Proceeding with caution.")
         
         # DEBUG: Log decision details
         if decision.recommendation != "NO_TRADE":
-            logger.info(f"🚨 TRADE POTENTIAL: {symbol} | Rec: {decision.recommendation}")
+            logger.info(f"🚨 TRADE POTENTIAL: {symbol} | Rec: {decision.recommendation} | Type: {trade_type}")
             logger.info(f"   Reason: {decision.reasoning}")
             logger.info(f"   Stats: Qual={decision.setup_quality:.2f} | Conf={decision.confidence:.2f} | Dir={decision.direction_bias}")
         else:
@@ -679,6 +938,75 @@ class TradingBot:
                 logger.info(f"🚫 ENTRY_BLOCKED | NO_VALID_ZONE | {symbol} Zone: [{decision.entry_zone_low:.6f} - {decision.entry_zone_high:.6f}]")
                 return
             
+            # ============================================
+            # PATTERN EXECUTION LAYER (VETO POWER)
+            # Sits between Permission and Entry.
+            # Can block trades if pattern incomplete or no proof.
+            # ============================================
+            pattern = self.pattern_engine.analyze(
+                df=df,
+                direction_bias=side,
+                htf_trend=None,  # HTF already validated above
+                run_mode=(self.current_mode == "RUN_MODE")
+            )
+            
+            # Log pattern detection with score (for training and debugging)
+            if pattern.variant != "NONE":
+                logger.info(f"📐 PATTERN | {symbol} | {pattern.family}.{pattern.variant} | Score={pattern.score:.2f} | Complete={pattern.is_complete} | Proof={pattern.proof_of_move}")
+            
+            # ============================================
+            # CHANGE 5: SCORING REPLACES VETO
+            # Pattern score affects POSITION SIZE, not permission
+            # Score tiers: 0.7+ = 100%, 0.5-0.7 = 70%, 0.3-0.5 = 50%, <0.3 = 30%
+            # ============================================
+            position_size_multiplier = 1.0
+            if pattern.score >= 0.70:
+                position_size_multiplier = 1.0
+                logger.info(f"💪 FULL_SIZE | {symbol} | Pattern score {pattern.score:.2f} >= 0.70")
+            elif pattern.score >= 0.50:
+                position_size_multiplier = 0.70
+                logger.info(f"📉 REDUCED_SIZE | {symbol} | Pattern score {pattern.score:.2f} -> 70% position")
+            elif pattern.score >= 0.30:
+                position_size_multiplier = 0.50
+                logger.info(f"📉 SMALL_SIZE | {symbol} | Pattern score {pattern.score:.2f} -> 50% position")
+            else:
+                position_size_multiplier = 0.30
+                logger.info(f"📉 MIN_SIZE | {symbol} | Pattern score {pattern.score:.2f} -> 30% position")
+            
+            # ============================================
+            # CHANGE 6: TIMING FIX (Confirm -> Arm, Displacement -> Trigger)
+            # Confirmation candle = ARMS the trade
+            # Displacement candle = TRIGGERS entry
+            # ============================================
+            
+            # Check for confirmation candle (first stage)
+            confirmation = self._check_confirmation_candle(df, side)
+            displacement = self._check_displacement_candle(df, side)
+            
+            # If already armed, check for displacement trigger
+            is_armed = self.pending_setups.get(symbol, {}).get('armed', False)
+            
+            if not is_armed and confirmation:
+                # ARM the trade - store in pending with armed flag
+                logger.info(f"🔫 TRADE_ARMED | {symbol} {side} | Waiting for displacement trigger")
+                # Continue to store setup below (will be armed)
+                
+            elif is_armed and displacement:
+                # TRIGGER the entry
+                logger.info(f"🚀 DISPLACEMENT_TRIGGER | {symbol} | Executing entry")
+                # Continue to execution below
+                
+            elif is_armed and not displacement:
+                # Still waiting for displacement
+                logger.info(f"⏳ ARMED_WAITING | {symbol} | Trade armed, waiting for displacement")
+                return  # Wait for next cycle
+            
+            # Override decision's SL/TP with pattern levels (always use pattern levels)
+            if pattern.stop_loss > 0 and pattern.take_profit > 0:
+                logger.info(f"✅ PATTERN_LEVELS | {symbol} | {pattern.variant} | SL={pattern.stop_loss:.6f} TP={pattern.take_profit:.6f}")
+                decision.stop_loss = pattern.stop_loss
+                decision.take_profit = pattern.take_profit
+            
             # Check if SL is valid (non-zero and reasonable distance)
             current_price = df['close'].iloc[-1]
             if side == 'LONG':
@@ -692,8 +1020,21 @@ class TradingBot:
                 logger.info(f"🚫 ENTRY_BLOCKED | NO_VALID_SL | {symbol}")
                 return
             
-            # Check Risk:Reward (must be at least 1:2)
+            # Check Risk:Reward
+            # Dynamic R:R based on Market Mode & Pattern Quality
+            min_rr = 1.5
+            
+            # Allow lower R:R for CHOPPY mode OR High-Quality Institutional Patterns
+            if self.current_market_mode == "CHOPPY" or pattern.family == "INSTITUTIONAL":
+                min_rr = 1.0  # Lower R:R for scalping/institutional setups
+            
             entry_mid = (decision.entry_zone_low + decision.entry_zone_high) / 2
+            
+            # ADJUST ENTRY MID IF PATTERN SUGGESTS ENTRY
+            if pattern.is_complete and pattern.entry_price > 0:
+                 # Use pattern entry as the new reference for R:R
+                 entry_mid = pattern.entry_price
+            
             if side == 'LONG':
                 risk = entry_mid - decision.stop_loss
                 reward = decision.take_profit - entry_mid
@@ -701,8 +1042,8 @@ class TradingBot:
                 risk = decision.stop_loss - entry_mid
                 reward = entry_mid - decision.take_profit
             
-            if risk <= 0 or reward / risk < 2.0:
-                logger.info(f"🚫 ENTRY_BLOCKED | BAD_RR | {symbol} R:R = 1:{reward/risk if risk > 0 else 0:.2f} < 1:2")
+            if risk <= 0 or reward / risk < min_rr:
+                logger.info(f"🚫 ENTRY_BLOCKED | BAD_RR | {symbol} R:R = 1:{reward/risk if risk > 0 else 0:.2f} < 1:{min_rr} ({self.current_market_mode})")
                 return
             
             # Check if price is INSIDE the zone right now (immediate entry allowed)
@@ -747,10 +1088,14 @@ class TradingBot:
                 if price <= 0:
                     logger.error(f"Invalid price for {symbol}: {price}")
                     return
-                    
-                margin_amt = balance * 0.95
                 
-                if margin_amt < 5:
+                # CHANGE 5: Apply pattern score to position sizing
+                # position_size_multiplier is set above based on pattern.score
+                base_margin = balance * 0.95
+                margin_amt = base_margin * position_size_multiplier
+                logger.info(f"📊 SIZING | Base: ${base_margin:.2f} x {position_size_multiplier:.0%} = ${margin_amt:.2f}")
+                
+                if margin_amt < 2:
                     logger.warning(f"Balance too low ($ {balance:.2f}) to open trade.")
                     return
 
@@ -1009,7 +1354,7 @@ class TradingBot:
         """
         try:
             balance = self.exchange.get_balance()
-            if balance < 10:
+            if balance < 4:
                 return
             
             # Determine size based on entry number
